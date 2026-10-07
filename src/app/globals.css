@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens — dipetakan dari DesainPakeAI prototype tokens.css
+ * (project AI MEDIA BUYER). Warna adalah peran semantik, bukan nilai mentah.
+ */
+@theme {
+  /* Neutral + surface */
+  --color-canvas: #ffffff;
+  --color-surface: #ffffff;
+  --color-sidebar: #f8f8f8;
+  --color-frame: #f6f6f6;
+  --color-stripe: #eeeeef;
+  --color-border: #e1e4ea;
+  --color-divider: #eeeeef;
+
+  /* Text */
+  --color-text: #1f2937;
+  --color-secondary: #4b5563;
+  --color-muted: #6b7280;
+  --color-subtle: #6b7280;
+
+  /* Accent */
+  --color-accent: #1f2937;
+  --color-accent-top: #36455a;
+  --color-primary: #1f2937;
+  --color-focus: #4268ff;
+
+  /* Status */
+  --color-success: #009b72;
+  --color-danger: #ff3546;
+  --color-warning: #ff862f;
+  --color-yellow: #f2bd50;
+  --color-info: #4268ff;
+  --color-violet: #8b5cf6;
+  --color-cyan: #009cbc;
+
+  /* Ink (teks/ikon kecil di atas permukaan terang; hue sama, lightness diturunkan agar lolos AA) */
+  --color-success-ink: color-mix(in srgb, #009b72 80%, #000);
+  --color-danger-ink: color-mix(in srgb, #ff3546 80%, #000);
+  --color-warning-ink: color-mix(in srgb, #ff862f 70%, #000);
+  --color-yellow-ink: color-mix(in srgb, #f2bd50 60%, #000);
+
+  /* Chart */
+  --color-chart-bar: #e7e7e7;
+  --color-chart-base: #f0f0f0;
+
+  /* Typography */
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-brand: 18px;
+  --text-heading: 24px;
+  --text-chart: 32px;
+
+  /* Radii */
+  --radius-control: 8px;
+  --radius-card: 12px;
+  --radius-inner: 9px;
+
+  /* Layout */
+  --container-sidebar: 250px;
+}
+
+:root {
+  --overlay: rgba(31, 41, 55, 0.3);
+  --duration-fast: 120ms;
+  --duration-normal: 180ms;
+  --duration-panel: 240ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    color: var(--color-text);
+    background: var(--color-canvas);
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  button,
+  select,
+  summary {
+    cursor: pointer;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  summary::-webkit-details-marker {
+    display: none;
+  }
+
+  dialog::backdrop {
+    background: var(--overlay);
+  }
+}
