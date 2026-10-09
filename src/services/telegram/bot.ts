@@ -1,11 +1,12 @@
 import { Bot } from "grammy";
-import { eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals, jobs, products, users } from "@/db/schema";
 import { createLoginLink } from "@/lib/auth";
 import { getEnv, isTelegramConfigured } from "@/lib/env";
 import { getActiveProductId, isKillSwitchActive, setKillSwitch } from "@/lib/settings";
 import { slugify } from "@/lib/slug";
+import { dispatchWorkflow } from "@/services/n8n/dispatch";
 
 let bot: Bot | null = null;
 
@@ -95,19 +96,63 @@ function registerHandlers(instance: Bot) {
     }
 
     try {
+      const tgUserId = user.telegramUserId ?? 0;
+      // Ambil konteks pemilik dari job riset terakhir user (jika ada)
+      const [lastJob] = await db
+        .select()
+        .from(jobs)
+        .where(
+          and(
+            eq(jobs.workflowKey, "research"),
+            eq(jobs.trigger, "user"),
+            sql`${jobs.input}->>'telegramUserId' = ${tgUserId.toString()}`
+          )
+        )
+        .orderBy(desc(jobs.createdAt))
+        .limit(1);
+
+      const lastInput = lastJob?.input as Record<string, unknown> | null;
+      const ownerContext = lastInput?.ownerContext as Record<string, unknown> | null;
+
+      // Buat produk kandidat dengan slug unik
+      const baseSlug = slugify(produk);
+      let slug = baseSlug;
+      let attempt = 0;
+      while (attempt < 3) {
+        const [existing] = await db
+          .select({ id: products.id })
+          .from(products)
+          .where(eq(products.slug, slug))
+          .limit(1);
+        if (!existing) break;
+        const suffix = Math.random().toString(36).substring(2, 6);
+        slug = `${baseSlug}-${suffix}`;
+        attempt++;
+      }
+      if (attempt >= 3) slug = `${baseSlug}-${Date.now().toString(36)}`;
+
       // Buat produk kandidat
       const [product] = await db
         .insert(products)
         .values({
           name: produk,
-          slug: slugify(produk),
+          slug,
           kind: "other",
           origin: "research",
           status: "candidate",
-          context: { telegramUserId: user.telegramUserId },
+          context: { telegramUserId: tgUserId, source: "telegram" },
           createdBy: user.id,
         })
         .returning();
+
+      // Siapkan ownerContext untuk job (pakai yang terakhir atau default)
+      const jobOwnerContext = ownerContext ?? {
+        productType: "other",
+        location: "Indonesia",
+        capitalIdr: 0,
+        minMarginPct: 0,
+        productionCapability: "Via Telegram",
+      };
 
       // Buat job research
       const [job] = await db
@@ -118,38 +163,36 @@ function registerHandlers(instance: Bot) {
           status: "queued",
           input: {
             productIds: [product.id],
-            ownerContext: {
-              productType: "other",
-              location: "Telegram",
-              capitalIdr: 0,
-              minMarginPct: 0,
-              productionCapability: "Via Telegram",
-            },
-            telegramUserId: user.telegramUserId,
+            candidates: [{ id: product.id, name: produk, note: null }],
+            ownerContext: jobOwnerContext,
+            suggestFromCategory: null,
+            telegramUserId: tgUserId,
           },
         })
         .returning();
 
-      // Panggil webhook n8n (fire and forget)
-      const env = getEnv();
-      if (env.N8N_WEBHOOK_BASE) {
-        fetch(`${env.N8N_WEBHOOK_BASE.replace(/\/$/, "")}/research`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-n8n-secret": env.N8N_TRIGGER_SECRET },
-          body: JSON.stringify({ jobId: job.id, input: { productIds: [product.id], ownerContext: {} } }),
-        }).catch((e) => {
-          console.error("[telegram] n8n webhook error:", e);
-          db.update(jobs).set({ status: "failed", error: "Gagal memicu webhook n8n." }).where(eq(jobs.id, job.id));
-        });
-      } else {
-        await db.update(jobs).set({ status: "failed", error: "N8N_WEBHOOK_BASE belum diisi" }).where(eq(jobs.id, job.id));
-        return ctx.reply("Riset gagal: N8N_WEBHOOK_BASE belum diisi di server.");
+      // Dispatch ke n8n pakai helper (await, bukan fire-and-forget)
+      const dispatchResult = await dispatchWorkflow({
+        jobId: job.id,
+        workflowKey: "research",
+        input: {
+          productIds: [product.id],
+          candidates: [{ id: product.id, name: produk, note: null }],
+          ownerContext: jobOwnerContext,
+          suggestFromCategory: null,
+        },
+      });
+
+      if (!dispatchResult.ok) {
+        // Job sudah diupdate ke failed di dispatchWorkflow
+        await ctx.reply(`Riset gagal: ${dispatchResult.error}`);
+        return;
       }
 
       await ctx.reply(
-        `✅ Riset dimulai untuk: ${produk}\n` +
-        `Job ID: \`${job.id}\`\n` +
-        `Produk ID: \`${product.id}\`\n\n` +
+        `Riset dimulai untuk: ${produk}\n` +
+        `Job ID: ${job.id}\n` +
+        `Produk ID: ${product.id}\n\n` +
         `Cek status di dashboard → Riset Pasar atau tunggu notifikasi selesai.`
       );
     } catch (e) {

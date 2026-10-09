@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# opencode (may contain MCP tokens / secrets)
+opencode.json
+opencode.jsonc

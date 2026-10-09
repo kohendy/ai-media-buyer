@@ -1,22 +1,17 @@
 import { CandidatesView } from "@/components/riset/candidates-view";
-import { getEnv } from "@/lib/env";
-import { unstable_noStore } from "next/cache";
-
-async function fetchCandidates() {
-  unstable_noStore();
-  const env = getEnv();
-  const res = await fetch(`${env.NEXT_PUBLIC_APP_URL}/api/research`, {
-    headers: { "content-type": "application/json" },
-    next: { revalidate: 0 },
-  });
-  if (!res.ok) return { items: [] };
-  const data = await res.json();
-  return data;
-}
+import { getCurrentUser } from "@/lib/auth";
+import { redirect } from "next/navigation";
+import { listResearchCandidates } from "@/lib/research-queries";
 
 export const instant = false;
 
 export default async function Page() {
-  const { items } = await fetchCandidates();
+  // A5: Verifikasi sesi untuk halaman dashboard
+  const user = await getCurrentUser();
+  if (!user) {
+    redirect("/login");
+  }
+
+  const items = await listResearchCandidates();
   return <CandidatesView initialCandidates={items} />;
 }

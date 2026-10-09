@@ -11,7 +11,7 @@ export const sourceSchema = z.object({
 /* ---------- Score (skor Jev per pertanyaan) ---------- */
 export const scoreSchema = z.object({
   questionKey: z.enum(["demand", "competition", "margin", "ad_ease", "owner_fit"]),
-  answer: z.string().min(1, "Jawaban wajib diisi"),
+  answer: z.enum(["rendah", "sedang", "tinggi"]),
   confidence: z.number().min(0).max(1, "Confidence 0-1"),
 });
 

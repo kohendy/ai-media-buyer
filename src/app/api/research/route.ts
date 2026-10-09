@@ -1,81 +1,26 @@
 import { db } from "@/db";
-import { jobs, marketBriefs, products } from "@/db/schema";
+import { jobs, products } from "@/db/schema";
 import { apiHandler, fail, ok, readJson } from "@/lib/api";
 import { requireUser } from "@/lib/auth";
-import { getEnv } from "@/lib/env";
 import { isKillSwitchActive } from "@/lib/settings";
 import { recordAudit } from "@/lib/audit";
 import { slugify } from "@/lib/slug";
 import { researchFormSchema } from "@/lib/riset-schema";
-import { desc, eq } from "drizzle-orm";
+import { listResearchCandidates } from "@/lib/research-queries";
+import { dispatchWorkflow } from "@/services/n8n/dispatch";
+import { eq } from "drizzle-orm";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 /** Ambil daftar kandidat produk (status=candidate, origin=research) beserta market brief & job terkini. */
 export async function GET() {
   return apiHandler(async () => {
     await requireUser();
-
-    const candidates = await db
-      .select({
-        id: products.id,
-        name: products.name,
-        kind: products.kind,
-        score: products.score,
-        confidence: products.confidence,
-        context: products.context,
-        createdAt: products.createdAt,
-        marketBrief: {
-          id: marketBriefs.id,
-          demandSummary: marketBriefs.demandSummary,
-          priceMin: marketBriefs.priceMin,
-          priceMax: marketBriefs.priceMax,
-          version: marketBriefs.version,
-          createdAt: marketBriefs.createdAt,
-        },
-        latestJob: {
-          id: jobs.id,
-          status: jobs.status,
-          error: jobs.error,
-          createdAt: jobs.createdAt,
-        },
-      })
-      .from(products)
-      .leftJoin(marketBriefs, eq(marketBriefs.productId, products.id))
-      .leftJoin(jobs, eq(jobs.workflowKey, "research"))
-      .where(eq(products.origin, "research"))
-      .orderBy(desc(products.createdAt));
-
-    // Gabungkan job per produk (ambil job terbaru per produk)
-    const jobsByProduct = await db
-      .select()
-      .from(jobs)
-      .where(eq(jobs.workflowKey, "research"))
-      .orderBy(desc(jobs.createdAt));
-
-    const jobMap = new Map<string, typeof jobsByProduct[0]>();
-    for (const job of jobsByProduct) {
-      const input = job.input as Record<string, unknown> | null;
-      const productIds = (input?.productIds as string[]) ?? [];
-      for (const pid of productIds) {
-        if (!jobMap.has(pid)) jobMap.set(pid, job);
-      }
-    }
-
-    const items = candidates.map((c) => ({
-      id: c.id,
-      name: c.name,
-      kind: c.kind,
-      score: c.score ? Number(c.score) : null,
-      confidence: c.confidence ? Number(c.confidence) * 100 : null,
-      context: c.context as Record<string, unknown> | null,
-      marketBrief: c.marketBrief?.id ? c.marketBrief : null,
-      latestJob: jobMap.get(c.id) ?? null,
-    }));
-
+    const items = await listResearchCandidates();
     return ok({ items });
   });
 }
 
-/** Buat kandidat produk (status=candidate, origin=research) dan picu job research dalam 1 transaksi. */
+/** Buat kandidat produk (status=candidate, origin=research) dan picu job research. */
 export async function POST(request: Request) {
   return apiHandler(async () => {
     const user = await requireUser();
@@ -92,18 +37,20 @@ export async function POST(request: Request) {
       });
     }
 
-    const { ownerContext, candidates, suggestFromCategory } = parsed.data;
-    const env = getEnv();
+    const { ownerContext, candidates: inputCandidates, suggestFromCategory } = parsed.data;
 
-    // Transaksi: insert products + insert job
+    // 1. Transaksi: insert products + insert job (tanpa panggil webhook)
     const result = await db.transaction(async (tx) => {
-      // 1. Buat produk kandidat
-      const productRows = await tx
-        .insert(products)
-        .values(
-          candidates.map((c) => ({
+      // 1a. Buat produk kandidat dengan slug unik
+      const productRows = [];
+      for (const c of inputCandidates) {
+        const baseSlug = slugify(c.name);
+        const uniqueSlug = await generateUniqueSlug(tx, baseSlug);
+        const [product] = await tx
+          .insert(products)
+          .values({
             name: c.name,
-            slug: slugify(c.name),
+            slug: uniqueSlug,
             kind: ownerContext.productType,
             origin: "research" as const,
             status: "candidate" as const,
@@ -113,11 +60,19 @@ export async function POST(request: Request) {
               candidateNote: c.note ?? null,
             },
             createdBy: user.id,
-          }))
-        )
-        .returning();
+          })
+          .returning();
+        productRows.push(product);
+      }
 
-      // 2. Buat job research
+      // 1b. Siapkan data candidates untuk webhook payload (A3)
+      const webhookCandidates = productRows.map((p, idx) => ({
+        id: p.id,
+        name: inputCandidates[idx].name,
+        note: inputCandidates[idx].note ?? null,
+      }));
+
+      // 1c. Buat job research
       const [job] = await tx
         .insert(jobs)
         .values({
@@ -126,30 +81,14 @@ export async function POST(request: Request) {
           status: "queued",
           input: {
             productIds: productRows.map((p) => p.id),
+            candidates: webhookCandidates,
             ownerContext,
             suggestFromCategory: suggestFromCategory ?? null,
           },
         })
         .returning();
 
-      // 3. Panggil webhook n8n (non-blocking, tapi catat error ke job)
-      if (env.N8N_WEBHOOK_BASE) {
-        try {
-          await fetch(`${env.N8N_WEBHOOK_BASE.replace(/\/$/, "")}/research`, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-n8n-secret": env.N8N_TRIGGER_SECRET },
-            body: JSON.stringify({ jobId: job.id, input: { productIds: productRows.map((p) => p.id), ownerContext } }),
-          });
-        } catch (e) {
-          await tx.update(jobs).set({ status: "failed", error: "Gagal memicu webhook n8n." }).where(eq(jobs.id, job.id));
-          throw e; // rollback transaksi
-        }
-      } else {
-        await tx.update(jobs).set({ status: "failed", error: "N8N_WEBHOOK_BASE belum diisi" }).where(eq(jobs.id, job.id));
-        throw new Error("N8N_WEBHOOK_BASE belum diisi");
-      }
-
-      // 4. Audit log untuk setiap produk
+      // 1d. Audit log untuk setiap produk
       for (const p of productRows) {
         await recordAudit({
           userId: user.id,
@@ -160,9 +99,68 @@ export async function POST(request: Request) {
         });
       }
 
-      return { products: productRows, job };
+      return { products: productRows, job, webhookCandidates };
     });
 
+    // 2. Panggil webhook n8n DI LUAR transaksi (pakai helper dispatchWorkflow)
+    const dispatchResult = await dispatchWorkflow({
+      jobId: result.job.id,
+      workflowKey: "research",
+      input: {
+        productIds: result.products.map((p) => p.id),
+        candidates: result.webhookCandidates,
+        ownerContext,
+        suggestFromCategory: suggestFromCategory ?? null,
+      },
+    });
+
+    // 3. Respons berdasarkan hasil dispatch
+    if (!dispatchResult.ok) {
+      // Produk dan job TETAP tersimpan, job status=failed sudah diupdate di dispatchWorkflow
+      return fail(502, "N8N_TIDAK_TERJANGKAU", dispatchResult.error ?? "Gagal menghubungi n8n", {
+        jobId: result.job.id,
+        products: result.products.map((p) => ({ id: p.id, name: p.name })),
+      });
+    }
+
+    // Sukses: job tetap queued, n8n akan callback running/succeeded
     return ok({ products: result.products, jobId: result.job.id }, { status: 201 });
   });
+}
+
+/** Generate slug unik dengan retry pada konflik unique constraint. */
+async function generateUniqueSlug(tx: PostgresJsDatabase<typeof import("@/db/schema")>, baseSlug: string): Promise<string> {
+  let slug = baseSlug;
+  let attempt = 0;
+  const maxAttempts = 3;
+
+  while (attempt < maxAttempts) {
+    try {
+      // Cek apakah slug sudah ada
+      const [existing] = await tx
+        .select({ id: products.id })
+        .from(products)
+        .where(eq(products.slug, slug))
+        .limit(1);
+
+      if (!existing) return slug;
+
+      // Tambah sufiks acak 4 karakter
+      const suffix = Math.random().toString(36).substring(2, 6);
+      slug = `${baseSlug}-${suffix}`;
+      attempt++;
+    } catch (e) {
+      // Jika error unique constraint (kode Postgres 23505), coba lagi
+      if (e instanceof Error && "code" in e && (e as { code?: string }).code === "23505") {
+        const suffix = Math.random().toString(36).substring(2, 6);
+        slug = `${baseSlug}-${suffix}`;
+        attempt++;
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  // Fallback: timestamp
+  return `${baseSlug}-${Date.now().toString(36)}`;
 }

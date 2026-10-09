@@ -1,10 +1,10 @@
-import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { jobs } from "@/db/schema";
 import { apiHandler, fail, header, ok, readJson } from "@/lib/api";
 import { checkSharedSecret, requireUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
 import { isKillSwitchActive } from "@/lib/settings";
+import { dispatchWorkflow } from "@/services/n8n/dispatch";
 
 const WORKFLOWS = [
   "research",
@@ -32,8 +32,8 @@ export async function POST(request: Request, context: { params: Promise<{ nama: 
     const authorizedBySecret = checkSharedSecret(header(request, "x-n8n-secret"), env.N8N_TRIGGER_SECRET);
     const user = authorizedBySecret ? null : await requireUser();
 
-    // Kill switch check untuk workflow yang dipicu user (bukan n8n/system)
-    if (!authorizedBySecret && (await isKillSwitchActive())) {
+    // Kill switch check untuk SEMUA pemanggil (termasuk n8n/system) sesuai PRD Keputusan 3
+    if (await isKillSwitchActive()) {
       return fail(409, "KILL_SWITCH_ACTIVE", "Kill switch aktif: workflow dibatalkan.");
     }
 
@@ -48,19 +48,16 @@ export async function POST(request: Request, context: { params: Promise<{ nama: 
       })
       .returning();
 
-    if (env.N8N_WEBHOOK_BASE) {
-      try {
-        await fetch(`${env.N8N_WEBHOOK_BASE.replace(/\/$/, "")}/${nama}`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-n8n-secret": env.N8N_TRIGGER_SECRET },
-          body: JSON.stringify({ jobId: job.id, input }),
-        });
-      } catch {
-        await db.update(jobs).set({ status: "failed", error: "Gagal memicu webhook n8n." }).where(eq(jobs.id, job.id));
-      }
-    } else {
-      // Jika webhook base kosong, jangan biarkan job queued selamanya
-      await db.update(jobs).set({ status: "failed", error: "N8N_WEBHOOK_BASE belum diisi" }).where(eq(jobs.id, job.id));
+    // Gunakan helper dispatchWorkflow untuk konsistensi
+    const dispatchResult = await dispatchWorkflow({
+      jobId: job.id,
+      workflowKey: nama,
+      input,
+    });
+
+    if (!dispatchResult.ok) {
+      // Job sudah diupdate ke failed di dispatchWorkflow
+      return fail(502, "N8N_TIDAK_TERJANGKAU", dispatchResult.error ?? "Gagal menghubungi n8n", { jobId: job.id });
     }
 
     return ok({ jobId: job.id, requestedBy: user?.id ?? "n8n" }, { status: 202 });

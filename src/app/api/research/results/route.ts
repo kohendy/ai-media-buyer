@@ -1,11 +1,12 @@
 import { db } from "@/db";
-import { jobs, judgmentQuestions, judgments, marketBriefs, products } from "@/db/schema";
+import { jobs, judgmentQuestions, judgments, marketBriefs, products, auditLog } from "@/db/schema";
 import { apiHandler, fail, header, ok, readJson } from "@/lib/api";
 import { checkSharedSecret } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
-import { recordAudit } from "@/lib/audit";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { researchResultsSchema, type ResearchResults } from "@/lib/research-results-schema";
+import { answerToScore, calculateAverageScore } from "@/lib/riset-scoring";
+import { parsePriceRange } from "@/lib/riset-price";
 
 /** Terima hasil riset dari n8n (dengan secret), simpan ke judgments & market_briefs. */
 export async function POST(request: Request) {
@@ -32,6 +33,23 @@ export async function POST(request: Request) {
     // Cek job ada
     const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
     if (!job) return fail(404, "JOB_NOT_FOUND", "Job tidak ditemukan.");
+
+    // Validasi: job harus workflowKey=research
+    if (job.workflowKey !== "research") {
+      return fail(400, "INVALID_WORKFLOW", "Job bukan workflow research.");
+    }
+
+    // Validasi: job belum final (bukan succeeded/failed)
+    if (job.status === "succeeded" || job.status === "failed") {
+      return fail(409, "JOB_FINAL", "Job sudah selesai, tidak bisa menambah hasil.");
+    }
+
+    // Validasi: productId harus termasuk di job.input.productIds
+    const jobInput = job.input as Record<string, unknown> | null;
+    const jobProductIds = (jobInput?.productIds as string[]) ?? [];
+    if (!jobProductIds.includes(productId)) {
+      return fail(400, "PRODUCT_NOT_IN_JOB", "Produk tidak termasuk dalam job ini.");
+    }
 
     // Cek produk ada
     const [product] = await db.select().from(products).where(eq(products.id, productId)).limit(1);
@@ -70,10 +88,31 @@ export async function POST(request: Request) {
         }
       }
 
-      // 2. Simpan judgments untuk setiap skor
+      // 2. Idempotensi: cek apakah hasil untuk (jobId, productId) sudah tercatat
+      const existingJudgment = await tx
+        .select()
+        .from(judgments)
+        .where(
+          and(
+            eq(judgments.subjectType, "product"),
+            eq(judgments.subjectId, productId),
+            sql`${judgments.questionId} IN (${sql.join(Array.from(questionMap.values()).map((v) => sql`${v}`), sql`, `)})`
+          )
+        )
+        .limit(1);
+
+      if (existingJudgment) {
+        // Sudah diproses, kembalikan duplicate
+        return { duplicate: true };
+      }
+
+      // 3. Simpan judgments untuk setiap skor (dengan answerToScore untuk validasi)
       for (const score of scores) {
         const questionId = questionMap.get(score.questionKey);
-        if (!questionId) continue; // seharusnya tidak terjadi
+        if (!questionId) continue;
+
+        // Validasi skor pakai answerToScore (akan throw kalau jawaban tidak valid)
+        answerToScore(score.questionKey, score.answer);
 
         await tx.insert(judgments).values({
           questionId,
@@ -87,8 +126,7 @@ export async function POST(request: Request) {
         });
       }
 
-      // 3. Simpan market_briefs (upsert by productId + version)
-      // Ambil versi terbaru
+      // 4. Simpan market_briefs (version auto-increment)
       const [latestBrief] = await tx
         .select()
         .from(marketBriefs)
@@ -98,13 +136,23 @@ export async function POST(request: Request) {
 
       const nextVersion = (latestBrief?.version ?? 0) + 1;
 
+      // Parse price range
+      const { min: priceMin, max: priceMax } = parsePriceRange(marketBrief.marketPrice);
+
+      // Parse competitors string ke array object
+      const competitorsArray = marketBrief.competitors
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => ({ summary: line }));
+
       await tx.insert(marketBriefs).values({
         productId,
         version: nextVersion,
         demandSummary: marketBrief.summary,
-        priceMin: parsePriceMin(marketBrief.marketPrice),
-        priceMax: parsePriceMax(marketBrief.marketPrice),
-        competitors: [], // JSON string dari marketBrief.competitors jika perlu parsing
+        priceMin: priceMin ?? null,
+        priceMax: priceMax ?? null,
+        competitors: competitorsArray,
         gaps: marketBrief.gaps,
         risks: marketBrief.risks,
         validationPlan: marketBrief.validationPlan,
@@ -117,22 +165,34 @@ export async function POST(request: Request) {
         contentMd: buildMarketBriefMarkdown(marketBrief, sources),
       });
 
-      // 4. Update job status
+      // 5. Update job: track completedProductIds
+      const currentOutput = job.output as Record<string, unknown> | null;
+      const completed = (currentOutput?.completedProductIds as string[]) ?? [];
+      if (!completed.includes(productId)) {
+        completed.push(productId);
+      }
+
+      const allCompleted = jobProductIds.every((pid) => completed.includes(pid));
+      const newStatus = allCompleted ? "succeeded" : "running";
+
       await tx
         .update(jobs)
         .set({
-          status: "succeeded",
+          status: newStatus,
           output: {
-            productId,
+            ...currentOutput,
+            completedProductIds: completed,
+            lastProductId: productId,
             marketBriefVersion: nextVersion,
             scoresCount: scores.length,
           },
-          finishedAt: now,
+          finishedAt: newStatus === "succeeded" ? now : null,
+          startedAt: job.status === "queued" ? now : job.startedAt,
         })
         .where(eq(jobs.id, jobId));
 
-      // 5. Update product dengan skor rata-rata & confidence
-      const avgScore = scores.reduce((sum, s) => sum + scoreToNumeric(s.answer), 0) / scores.length;
+      // 6. Update product dengan skor rata-rata 1-5 & confidence
+      const avgScore = calculateAverageScore(scores);
       const avgConfidence = scores.reduce((sum, s) => sum + s.confidence, 0) / scores.length;
 
       await tx
@@ -143,9 +203,9 @@ export async function POST(request: Request) {
         })
         .where(eq(products.id, productId));
 
-      // 6. Audit log
-      await recordAudit({
-        userId: null, // system/n8n
+      // 7. Audit log (pakai tx untuk konsistensi transaksi)
+      await tx.insert(auditLog).values({
+        userId: null,
         action: "create",
         entityType: "market_briefs",
         entityId: productId,
@@ -160,34 +220,6 @@ export async function POST(request: Request) {
 
     return ok({ success: true, jobId, productId });
   });
-}
-
-/** Konversi jawaban ordinal ke numerik 1-3 untuk rata-rata skor. */
-function scoreToNumeric(answer: string): number {
-  switch (answer) {
-    case "tinggi":
-      return 3;
-    case "sedang":
-      return 2;
-    case "rendah":
-      return 1;
-    default:
-      return 2; // default sedang
-  }
-}
-
-/** Parse priceMin dari string "Rp 89.000 – 159.000" atau "89000-159000". */
-function parsePriceMin(priceStr: string): number | null {
-  const match = priceStr.match(/(\d[\d.,]*)/);
-  if (!match) return null;
-  return parseInt(match[1].replace(/[.,]/g, ""), 10);
-}
-
-/** Parse priceMax dari string. */
-function parsePriceMax(priceStr: string): number | null {
-  const matches = priceStr.match(/(\d[\d.,]*)/g);
-  if (!matches || matches.length < 2) return parsePriceMin(priceStr);
-  return parseInt(matches[matches.length - 1].replace(/[.,]/g, ""), 10);
 }
 
 /** Build markdown content untuk market_briefs.contentMd. */

@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo, useState, useEffect, useCallback } from "react";
+import { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
-import { Check, SlidersHorizontal, Plus } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Check, SlidersHorizontal, Plus, RefreshCw } from "lucide-react";
 import {
   Button,
   Chip,
@@ -18,6 +19,7 @@ import {
   notify,
 } from "@/components/ui";
 import { ResearchFormModal } from "./research-form-modal";
+import type { Score as ScoreType } from "@/lib/riset-types";
 
 type MarketBrief = {
   id: string;
@@ -47,6 +49,7 @@ type Candidate = {
   marketBrief: MarketBrief;
   latestJob: JobStatus;
   status: ProductStatus;
+  scores: ScoreType[];
 };
 
 type SortKey = "score" | "name" | "confidence";
@@ -92,44 +95,115 @@ function getJobStatusLabel(status: "queued" | "running" | "succeeded" | "failed"
   }
 }
 
+const QUESTION_LABELS: Record<string, string> = {
+  demand: "Permintaan",
+  competition: "Persaingan",
+  margin: "Margin",
+  ad_ease: "Kemudahan diiklankan",
+  owner_fit: "Kecocokan pemilik",
+};
+
+const QUESTION_KEYS = ["demand", "competition", "margin", "ad_ease", "owner_fit"] as const;
+
 export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
+  const router = useRouter();
   const [candidates, setCandidates] = useState<Candidate[]>(initialCandidates);
   const [sort, setSort] = useState<SortKey>("score");
   const [onlyHigh, setOnlyHigh] = useState(false);
   const [selected, setSelected] = useState<Candidate | null>(null);
   const [formOpen, setFormOpen] = useState(false);
-  const [pollingJobId, setPollingJobId] = useState<string | null>(null);
 
-  // Polling job status setiap 5 detik saat ada job aktif
-  useEffect(() => {
-    if (!pollingJobId) return;
-    const interval = setInterval(async () => {
+  // Polling state: single timer for all active jobs
+  const [polling, setPolling] = useState(false);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const backoffRef = useRef(5000); // start at 5s, max 30s
+
+  // Determine which job IDs need polling (queued or running)
+  const activeJobIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const c of candidates) {
+      if (c.latestJob && (c.latestJob.status === "queued" || c.latestJob.status === "running")) {
+        ids.add(c.latestJob.id);
+      }
+    }
+    return Array.from(ids);
+  }, [candidates]);
+
+  // Poll all active jobs with single timer + backoff
+  const pollJobs = useCallback(async () => {
+    if (activeJobIds.length === 0) {
+      setPolling(false);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
+
+    setPolling(true);
+    let anyStillActive = false;
+
+    for (const jobId of activeJobIds) {
       try {
-        const res = await fetch(`/api/workflows/jobs/${pollingJobId}`);
-        if (!res.ok) return;
+        const res = await fetch(`/api/workflows/jobs/${jobId}`);
+        if (!res.ok) continue;
         const data = await res.json();
         const job = data.job;
-        if (job) {
-          setCandidates((prev) =>
-            prev.map((c) =>
-              c.latestJob?.id === pollingJobId ? { ...c, latestJob: job } : c
-            )
-          );
-          if (job.status === "succeeded" || job.status === "failed") {
-            setPollingJobId(null);
-            if (job.status === "succeeded") {
-              notify("Riset selesai. Data kandidat diperbarui.");
-            } else {
-              notify(`Riset gagal: ${job.error ?? "Unknown error"}`);
-            }
-          }
+        if (!job) continue;
+
+        anyStillActive = job.status === "queued" || job.status === "running";
+
+        // Update candidate(s) with this job
+        setCandidates((prev) =>
+          prev.map((c) =>
+            c.latestJob?.id === jobId ? { ...c, latestJob: job } : c
+          )
+        );
+
+        if (job.status === "succeeded") {
+          // Refresh server data to get updated scores, briefs, status
+          router.refresh();
+          notify("Riset selesai. Data kandidat diperbarui.");
+        } else if (job.status === "failed") {
+          notify(`Riset gagal: ${job.error ?? "Unknown error"}`);
         }
       } catch {
-        // ignore
+        // ignore network errors, will retry with backoff
       }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [pollingJobId]);
+    }
+
+    // Adjust backoff
+    if (anyStillActive) {
+      backoffRef.current = Math.min(backoffRef.current * 1.5, 30000);
+    } else {
+      backoffRef.current = 5000;
+      setPolling(false);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    }
+  }, [activeJobIds, router]);
+
+  // Start/stop polling based on activeJobIds
+  useEffect(() => {
+    if (activeJobIds.length > 0 && !intervalRef.current) {
+      backoffRef.current = 5000;
+      pollJobs(); // immediate first poll
+      intervalRef.current = setInterval(pollJobs, backoffRef.current);
+    } else if (activeJobIds.length === 0 && intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+      setPolling(false);
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [activeJobIds, pollJobs]);
 
   const visible = useMemo(() => {
     const list = candidates.filter((c) => !onlyHigh || (c.score ?? 0) >= 4.0);
@@ -160,9 +234,9 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
       ...p,
       marketBrief: null,
       latestJob: { id: result.jobId, status: "queued" as const, error: null, createdAt: new Date().toISOString() },
+      scores: [],
     }));
     setCandidates((prev) => [...newProducts, ...prev]);
-    setPollingJobId(result.jobId);
     notify("Riset dimulai. Status job akan diperbarui otomatis.");
   }, []);
 
@@ -171,7 +245,11 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
       notify("Produk ini sudah dipilih.");
       return;
     }
-    // Panggil API untuk update status produk
+    // Validasi: hanya boleh pilih jika ada market brief
+    if (!candidate.marketBrief) {
+      notify("Belum ada market brief. Tunggu riset selesai.");
+      return;
+    }
     try {
       const res = await fetch(`/api/products/${candidate.id}/select`, {
         method: "POST",
@@ -181,7 +259,6 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
         const err = await res.json();
         throw new Error(err.error?.message || "Gagal memilih produk");
       }
-      // Update state lokal
       setCandidates((prev) =>
         prev.map((c) => (c.id === candidate.id ? { ...c, status: "selected" as ProductStatus } : c))
       );
@@ -193,7 +270,7 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
     }
   }, []);
 
-  // Ambil konteks pemilik dari kandidat pertama yang punya context (untuk panel info)
+  // Ambil konteks pemilik dari kandidat pertama yang punya context
   const ownerContext = useMemo(() => {
     for (const c of candidates) {
       if (c.context?.ownerContext) return c.context.ownerContext as Record<string, unknown>;
@@ -210,6 +287,11 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
         <Button variant="primary" icon={Plus} onClick={() => setFormOpen(true)}>
           Mulai riset baru
         </Button>
+        {polling && (
+          <Button variant="default" icon={RefreshCw} disabled>
+            Memantau {activeJobIds.length} job…
+          </Button>
+        )}
       </PageHeader>
 
       {ownerContext && (
@@ -234,7 +316,7 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
           <Select
             id="riset-sort"
             value={sort}
-            onChange={(event) => setSort(event.target.value as SortKey)}
+            onChange={(event: React.ChangeEvent<HTMLSelectElement>) => setSort(event.target.value as SortKey)}
           >
             <option value="score">Skor tertinggi</option>
             <option value="name">Nama (A–Z)</option>
@@ -248,7 +330,7 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
       </div>
 
       <p className="m-0 text-xs text-muted">
-        Skor 0–5 pada lima pertanyaan Jev. Untuk persaingan, skor tinggi berarti pasar makin ramai.
+        Skor 1–5 pada lima pertanyaan Jev. Untuk persaingan, skor tinggi berarti persaingan rendah (lebih baik).
       </p>
 
       <div className="grid gap-4">
@@ -272,17 +354,24 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
               )}
             </div>
 
-            {candidate.score != null && (
+            {candidate.score != null && candidate.scores.length > 0 && (
               <div className="mt-3 grid gap-x-5 gap-y-3 [grid-template-columns:repeat(auto-fit,minmax(150px,1fr))]">
-                {[
-                  { label: "Permintaan", key: "demand" },
-                  { label: "Persaingan", key: "competition" },
-                  { label: "Margin", key: "margin" },
-                  { label: "Kemudahan diiklankan", key: "ad_ease" },
-                  { label: "Kecocokan pemilik", key: "owner_fit" },
-                ].map((s) => (
-                  <Score key={s.key} label={s.label} value="—" pct={0} tone="accent" />
-                ))}
+                {QUESTION_KEYS.map((key) => {
+                  const score = candidate.scores.find((s) => s.questionKey === key);
+                  if (!score) return null;
+                  // Convert 1-5 scale to percentage for bar
+                  const pct = (score.confidence * 100);
+                  const tone = key === "competition" && score.answer === "tinggi" ? "danger" : "accent";
+                  return (
+                    <Score
+                      key={key}
+                      label={QUESTION_LABELS[key]}
+                      value={`${score.answer} (${answerToScore(key, score.answer)} / 5)`}
+                      pct={pct}
+                      tone={tone}
+                    />
+                  );
+                })}
               </div>
             )}
 
@@ -308,9 +397,13 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
             )}
 
             <div className="mt-3.5 flex flex-wrap items-center gap-2">
-              {candidate.status !== "selected" ? (
+              {candidate.status !== "selected" && candidate.marketBrief ? (
                 <Button variant="primary" onClick={() => handleSelectProduct(candidate)} icon={Check}>
                   Pilih produk
+                </Button>
+              ) : candidate.status !== "selected" ? (
+                <Button variant="default" disabled>
+                  Menunggu brief
                 </Button>
               ) : (
                 <Button variant="default" disabled icon={Check}>
@@ -357,4 +450,19 @@ export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
       <ResearchFormModal open={formOpen} onClose={() => setFormOpen(false)} onSubmit={handleStartResearch} />
     </>
   );
+}
+
+// Helper to compute score for display (1-5 scale with competition inverted)
+function answerToScore(questionKey: string, answer: string): number {
+  const normalized = answer.toLowerCase().trim();
+  if (!["rendah", "sedang", "tinggi"].includes(normalized)) return 3;
+  let score: number;
+  switch (normalized) {
+    case "rendah": score = 1; break;
+    case "sedang": score = 3; break;
+    case "tinggi": score = 5; break;
+    default: score = 3;
+  }
+  if (questionKey === "competition") score = 6 - score;
+  return score;
 }
