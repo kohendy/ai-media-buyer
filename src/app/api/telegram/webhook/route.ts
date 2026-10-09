@@ -3,7 +3,7 @@ import { telegramUpdates } from "@/db/schema";
 import { apiHandler, fail, header, ok } from "@/lib/api";
 import { safeEqual } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
-import { getBot } from "@/services/telegram/bot";
+import { initBot } from "@/services/telegram/bot";
 
 /**
  * Webhook Telegram: diverifikasi dengan secret token, `update_id` diproses sekali,
@@ -30,11 +30,11 @@ export async function POST(request: Request) {
       .returning();
     if (inserted.length === 0) return ok({ skipped: true });
 
-    const bot = getBot();
+    const bot = await initBot();
     if (!bot) return fail(503, "BOT_NOT_CONFIGURED", "TELEGRAM_BOT_TOKEN belum diisi.");
 
-    // Balas cepat; pemrosesan bot dilakukan tanpa menunggu lama.
-    void bot.handleUpdate(update as never).catch((error) => {
+    // Proses update dan tunggu selesai (tidak fire-and-forget)
+    await bot.handleUpdate(update as never).catch((error) => {
       console.error("[telegram]", error instanceof Error ? error.message : error);
     });
 

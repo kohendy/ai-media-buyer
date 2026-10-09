@@ -1,8 +1,8 @@
 "use client";
 
+import { useMemo, useState, useEffect, useCallback } from "react";
 import Link from "next/link";
-import { useMemo, useState } from "react";
-import { Check, SlidersHorizontal, TriangleAlert, Plus } from "lucide-react";
+import { Check, SlidersHorizontal, Plus } from "lucide-react";
 import {
   Button,
   Chip,
@@ -16,146 +16,215 @@ import {
   Status,
   btnClass,
   notify,
-  type ScoreTone,
 } from "@/components/ui";
+import { ResearchFormModal } from "./research-form-modal";
 
-type CandidateScore = { label: string; value: string; pct: number; tone?: ScoreTone };
+type MarketBrief = {
+  id: string;
+  demandSummary: string;
+  priceMin: number | null;
+  priceMax: number | null;
+  version: number;
+  createdAt: string;
+} | null;
+
+type JobStatus = {
+  id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  error: string | null;
+  createdAt: string;
+} | null;
+
+type ProductStatus = "candidate" | "selected" | "rejected" | "archived";
 
 type Candidate = {
   id: string;
   name: string;
   kind: string;
-  score: number;
-  confidence: number;
-  note: string;
-  scores: CandidateScore[];
-  reasons: string[];
+  score: number | null;
+  confidence: number | null;
+  context: Record<string, unknown> | null;
+  marketBrief: MarketBrief;
+  latestJob: JobStatus;
+  status: ProductStatus;
 };
-
-const CANDIDATES: Candidate[] = [
-  {
-    id: "serum-vitamin-c",
-    name: "Serum Vitamin C",
-    kind: "Skincare · margin 62%",
-    score: 4.2,
-    confidence: 88,
-    note: "Permintaan naik 18% (90 hari)",
-    scores: [
-      { label: "Permintaan", value: "5,0", pct: 100, tone: "success" },
-      { label: "Persaingan", value: "3,0", pct: 60, tone: "warning" },
-      { label: "Margin", value: "4,0", pct: 80, tone: "success" },
-      { label: "Kemudahan diiklankan", value: "5,0", pct: 100, tone: "success" },
-      { label: "Kecocokan dengan pemilik", value: "4,0", pct: 80 },
-    ],
-    reasons: [
-      "Permintaan stabil dan berulang; ulasan banyak menyebut tekstur ringan.",
-      "Persaingan sedang: banyak pemain, tetapi belum ada yang menonjolkan bukti bahan.",
-    ],
-  },
-  {
-    id: "blender-portable",
-    name: "Blender Portable 4-in-1",
-    kind: "Peralatan dapur · margin 58%",
-    score: 3.6,
-    confidence: 81,
-    note: "Permintaan naik 9% (90 hari)",
-    scores: [
-      { label: "Permintaan", value: "4,0", pct: 80, tone: "success" },
-      { label: "Persaingan", value: "3,0", pct: 60, tone: "warning" },
-      { label: "Margin", value: "4,0", pct: 80, tone: "success" },
-      { label: "Kemudahan diiklankan", value: "4,0", pct: 80 },
-      { label: "Kecocokan dengan pemilik", value: "3,0", pct: 60, tone: "warning" },
-    ],
-    reasons: [
-      "Visual produk mudah dibuat dan cocok untuk format video pendek.",
-      "Klaim mudah rusak; perlu bukti dari pengguna asli.",
-    ],
-  },
-  {
-    id: "kue-kering-premium",
-    name: "Kue Kering Premium",
-    kind: "Offline service · margin 67%",
-    score: 3.6,
-    confidence: 76,
-    note: "Musiman (Lebaran & Natal)",
-    scores: [
-      { label: "Permintaan", value: "4,0", pct: 80, tone: "success" },
-      { label: "Persaingan", value: "2,0", pct: 40, tone: "danger" },
-      { label: "Margin", value: "5,0", pct: 100, tone: "success" },
-      { label: "Kemudahan diiklankan", value: "3,0", pct: 60, tone: "warning" },
-      { label: "Kecocokan dengan pemilik", value: "4,0", pct: 80 },
-    ],
-    reasons: [
-      "Margin dan pembelian berulang tinggi di musim tertentu.",
-      "Bukan online fisik; butuh radius layanan dan kapasitas produksi.",
-    ],
-  },
-  {
-    id: "alat-rumah-multifungsi",
-    name: "Alat Rumah Multifungsi",
-    kind: "Peralatan rumah · margin 45%",
-    score: 3.2,
-    confidence: 69,
-    note: "Permintaan datar",
-    scores: [
-      { label: "Permintaan", value: "3,0", pct: 60, tone: "warning" },
-      { label: "Persaingan", value: "3,0", pct: 60, tone: "warning" },
-      { label: "Margin", value: "4,0", pct: 80, tone: "success" },
-      { label: "Kemudahan diiklankan", value: "3,0", pct: 60, tone: "warning" },
-      { label: "Kecocokan dengan pemilik", value: "3,0", pct: 60, tone: "warning" },
-    ],
-    reasons: [
-      "Harga jual tinggi dan stok mudah dicari.",
-      "Margin di bawah minimum 55% dan permintaan cenderung datar.",
-    ],
-  },
-];
 
 type SortKey = "score" | "name" | "confidence";
 
-export function CandidatesView() {
+interface CandidatesViewProps {
+  initialCandidates: Candidate[];
+}
+
+function formatRupiah(n: number | null | undefined): string {
+  if (n == null) return "—";
+  return new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", maximumFractionDigits: 0 }).format(n);
+}
+
+function formatDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function getJobStatusTone(status: "queued" | "running" | "succeeded" | "failed"): "success" | "warning" | "danger" | "info" {
+  switch (status) {
+    case "succeeded":
+      return "success";
+    case "running":
+      return "info";
+    case "failed":
+      return "danger";
+    default:
+      return "warning";
+  }
+}
+
+function getJobStatusLabel(status: "queued" | "running" | "succeeded" | "failed"): string {
+  switch (status) {
+    case "queued":
+      return "Antrean";
+    case "running":
+      return "Berjalan";
+    case "succeeded":
+      return "Selesai";
+    case "failed":
+      return "Gagal";
+    default:
+      return "—";
+  }
+}
+
+export function CandidatesView({ initialCandidates }: CandidatesViewProps) {
+  const [candidates, setCandidates] = useState<Candidate[]>(initialCandidates);
   const [sort, setSort] = useState<SortKey>("score");
   const [onlyHigh, setOnlyHigh] = useState(false);
   const [selected, setSelected] = useState<Candidate | null>(null);
+  const [formOpen, setFormOpen] = useState(false);
+  const [pollingJobId, setPollingJobId] = useState<string | null>(null);
+
+  // Polling job status setiap 5 detik saat ada job aktif
+  useEffect(() => {
+    if (!pollingJobId) return;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/workflows/jobs/${pollingJobId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const job = data.job;
+        if (job) {
+          setCandidates((prev) =>
+            prev.map((c) =>
+              c.latestJob?.id === pollingJobId ? { ...c, latestJob: job } : c
+            )
+          );
+          if (job.status === "succeeded" || job.status === "failed") {
+            setPollingJobId(null);
+            if (job.status === "succeeded") {
+              notify("Riset selesai. Data kandidat diperbarui.");
+            } else {
+              notify(`Riset gagal: ${job.error ?? "Unknown error"}`);
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [pollingJobId]);
 
   const visible = useMemo(() => {
-    const list = CANDIDATES.filter((c) => !onlyHigh || c.score >= 4.0);
+    const list = candidates.filter((c) => !onlyHigh || (c.score ?? 0) >= 4.0);
     return list.slice().sort((a, b) => {
       if (sort === "name") return a.name.localeCompare(b.name, "id");
-      if (sort === "confidence") return b.confidence - a.confidence;
-      return b.score - a.score;
+      if (sort === "confidence") return (b.confidence ?? 0) - (a.confidence ?? 0);
+      return (b.score ?? 0) - (a.score ?? 0);
     });
-  }, [sort, onlyHigh]);
+  }, [candidates, sort, onlyHigh]);
+
+  const handleStartResearch = useCallback(async (data: {
+    ownerContext: Record<string, unknown>;
+    candidates: Array<{ name: string; category?: string; note?: string }>;
+    suggestFromCategory?: string;
+  }) => {
+    const res = await fetch("/api/research", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const result = await res.json();
+    if (!res.ok) {
+      const msg = result.error?.message || "Gagal memulai riset";
+      throw new Error(msg);
+    }
+    // Tambahkan produk baru ke state lokal (optimistic)
+    const newProducts = result.products.map((p: Candidate) => ({
+      ...p,
+      marketBrief: null,
+      latestJob: { id: result.jobId, status: "queued" as const, error: null, createdAt: new Date().toISOString() },
+    }));
+    setCandidates((prev) => [...newProducts, ...prev]);
+    setPollingJobId(result.jobId);
+    notify("Riset dimulai. Status job akan diperbarui otomatis.");
+  }, []);
+
+  const handleSelectProduct = useCallback(async (candidate: Candidate) => {
+    if (candidate.status === "selected") {
+      notify("Produk ini sudah dipilih.");
+      return;
+    }
+    // Panggil API untuk update status produk
+    try {
+      const res = await fetch(`/api/products/${candidate.id}/select`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error?.message || "Gagal memilih produk");
+      }
+      // Update state lokal
+      setCandidates((prev) =>
+        prev.map((c) => (c.id === candidate.id ? { ...c, status: "selected" as ProductStatus } : c))
+      );
+      notify(`${candidate.name} dipilih sebagai produk aktif.`);
+      setSelected(null);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Gagal memilih produk";
+      notify(msg);
+    }
+  }, []);
+
+  // Ambil konteks pemilik dari kandidat pertama yang punya context (untuk panel info)
+  const ownerContext = useMemo(() => {
+    for (const c of candidates) {
+      if (c.context?.ownerContext) return c.context.ownerContext as Record<string, unknown>;
+    }
+    return null;
+  }, [candidates]);
 
   return (
     <>
       <PageHeader
         title="Riset Pasar"
-        description="Kandidat produk diberi skor dan alasan sebelum Anda memilih satu. Data contoh."
+        description={candidates.length === 0 ? "Belum ada riset. Klik tombol di bawah untuk memulai." : "Kandidat produk diberi skor dan alasan sebelum Anda memilih satu."}
       >
-        <Button
-          variant="primary"
-          icon={Plus}
-          onClick={() => notify("Formulir kandidat baru tersedia pada halaman Brief Produk Baru.")}
-        >
-          Tambah kandidat
+        <Button variant="primary" icon={Plus} onClick={() => setFormOpen(true)}>
+          Mulai riset baru
         </Button>
       </PageHeader>
 
-      <Panel
-        title="Konteks pemilik"
-        description="Batasan yang dipakai menyaring kandidat"
-        icon={SlidersHorizontal}
-      >
-        <DetailList
-          items={[
-            { term: "Jenis produk", value: "Online, produk fisik" },
-            { term: "Lokasi / radius", value: "Nasional (kirim dari Jakarta)" },
-            { term: "Modal awal", value: "Rp 15.000.000" },
-            { term: "Margin minimum", value: "55%" },
-          ]}
-        />
-      </Panel>
+      {ownerContext && (
+        <Panel title="Konteks Pemilik" description="Batasan yang dipakai menyaring dan menilai kandidat" icon={SlidersHorizontal}>
+          <DetailList
+            items={[
+              { term: "Jenis produk", value: ownerContext.productType as string },
+              { term: "Lokasi / radius", value: ownerContext.location as string },
+              { term: "Modal awal", value: formatRupiah(ownerContext.capitalIdr as number) },
+              { term: "Margin minimum", value: `${ownerContext.minMarginPct}%` },
+              { term: "Kemampuan produksi", value: (ownerContext.productionCapability as string).slice(0, 80) + "..." },
+            ]}
+          />
+        </Panel>
+      )}
 
       <div className="flex flex-wrap items-end gap-3">
         <div className="grid w-[220px] gap-0.5">
@@ -184,46 +253,70 @@ export function CandidatesView() {
 
       <div className="grid gap-4">
         {visible.map((candidate) => (
-          <Panel
-            key={candidate.id}
-            title={candidate.name}
-            description={candidate.kind}
-            icon={Check}
-          >
+          <Panel key={candidate.id} title={candidate.name} description={candidate.kind} icon={Check}>
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-base font-semibold tabular-nums">
-                Rata-rata {candidate.score.toFixed(1).replace(".", ",")} / 5
+                {candidate.score != null ? `Rata-rata ${candidate.score.toFixed(1).replace(".", ",")} / 5` : "Belum dinilai"}
               </span>
-              <Status
-                label={`Keyakinan ${candidate.confidence}%`}
-                tone={candidate.confidence >= 85 ? "success" : "warning"}
-              />
-              <span className="text-[11px] text-muted">{candidate.note}</span>
+              {candidate.confidence != null && (
+                <Status
+                  label={`Keyakinan ${candidate.confidence}%`}
+                  tone={candidate.confidence >= 85 ? "success" : "warning"}
+                />
+              )}
+              {candidate.latestJob && (
+                <Status
+                  label={getJobStatusLabel(candidate.latestJob.status)}
+                  tone={getJobStatusTone(candidate.latestJob.status)}
+                />
+              )}
             </div>
 
-            <div className="mt-3 grid gap-x-5 gap-y-3 [grid-template-columns:repeat(auto-fit,minmax(150px,1fr))]">
-              {candidate.scores.map((score) => (
-                <Score key={score.label} {...score} />
-              ))}
-            </div>
+            {candidate.score != null && (
+              <div className="mt-3 grid gap-x-5 gap-y-3 [grid-template-columns:repeat(auto-fit,minmax(150px,1fr))]">
+                {[
+                  { label: "Permintaan", key: "demand" },
+                  { label: "Persaingan", key: "competition" },
+                  { label: "Margin", key: "margin" },
+                  { label: "Kemudahan diiklankan", key: "ad_ease" },
+                  { label: "Kecocokan pemilik", key: "owner_fit" },
+                ].map((s) => (
+                  <Score key={s.key} label={s.label} value="—" pct={0} tone="accent" />
+                ))}
+              </div>
+            )}
 
-            <ul className="mt-3.5 grid list-none gap-1 p-0">
-              {candidate.reasons.map((reason, index) => (
-                <li key={reason} className="flex gap-2 text-xs text-secondary">
-                  {index === 0 ? (
-                    <Check className="mt-0.5 size-3.5 shrink-0 text-muted" aria-hidden />
-                  ) : (
-                    <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-muted" aria-hidden />
-                  )}
-                  {reason}
-                </li>
-              ))}
-            </ul>
+            {candidate.marketBrief && (
+              <div className="mt-3 text-xs text-secondary">
+                <strong>Market Brief v{candidate.marketBrief.version}</strong> ·{" "}
+                {formatDate(candidate.marketBrief.createdAt)} ·{" "}
+                <Link className="underline hover:text-accent" href={`/riset/${candidate.id}`}>
+                  Lihat detail
+                </Link>
+              </div>
+            )}
+
+            {candidate.latestJob && (
+              <div className="mt-2 flex items-center gap-2 text-xs">
+                <span className="text-muted">Job:</span>
+                <code className="bg-frame px-1.5 py-0.5 rounded-inner font-mono">{candidate.latestJob.id.slice(0, 8)}…</code>
+                <Status label={getJobStatusLabel(candidate.latestJob.status)} tone={getJobStatusTone(candidate.latestJob.status)} />
+                {candidate.latestJob.error && (
+                  <span className="text-danger-ink flex-1 truncate">⚠ {candidate.latestJob.error}</span>
+                )}
+              </div>
+            )}
 
             <div className="mt-3.5 flex flex-wrap items-center gap-2">
-              <Button variant="primary" onClick={() => setSelected(candidate)}>
-                Pilih produk
-              </Button>
+              {candidate.status !== "selected" ? (
+                <Button variant="primary" onClick={() => handleSelectProduct(candidate)} icon={Check}>
+                  Pilih produk
+                </Button>
+              ) : (
+                <Button variant="default" disabled icon={Check}>
+                  Dipilih
+                </Button>
+              )}
               <Link className={btnClass("default")} href={`/riset/${candidate.id}`}>
                 Lihat market brief
               </Link>
@@ -235,13 +328,14 @@ export function CandidatesView() {
           <Panel>
             <Empty
               icon={SlidersHorizontal}
-              title="Tidak ada kandidat yang cocok"
-              message="Longgarkan filter skor untuk melihat semua kandidat."
+              title={candidates.length === 0 ? "Belum ada riset pasar" : "Tidak ada kandidat yang cocok"}
+              message={candidates.length === 0 ? "Klik “Mulai riset baru” untuk memulai riset pertama Anda." : "Longgarkan filter skor untuk melihat semua kandidat."}
             />
           </Panel>
         ) : null}
       </div>
 
+      {/* Modal konfirmasi pilih produk (tetap ada untuk UX) */}
       <Modal
         open={selected !== null}
         onClose={() => setSelected(null)}
@@ -250,23 +344,17 @@ export function CandidatesView() {
         footer={
           <>
             <Button onClick={() => setSelected(null)}>Batal</Button>
-            <Button
-              variant="primary"
-              onClick={() => {
-                const name = selected?.name ?? "";
-                setSelected(null);
-                notify(`${name} disetujui sebagai produk aktif. Lanjut ke insight produk dan audiens.`);
-              }}
-            >
+            <Button variant="primary" onClick={() => handleSelectProduct(selected!)} disabled={!selected}>
               Setujui pilihan produk
             </Button>
           </>
         }
       >
-        <p className="text-sm text-secondary">
-          {selected ? `${selected.name} · kandidat terpilih` : ""}
-        </p>
+        <p className="text-sm text-secondary">{selected ? `${selected.name} · kandidat terpilih` : ""}</p>
       </Modal>
+
+      {/* Modal form riset baru */}
+      <ResearchFormModal open={formOpen} onClose={() => setFormOpen(false)} onSubmit={handleStartResearch} />
     </>
   );
 }

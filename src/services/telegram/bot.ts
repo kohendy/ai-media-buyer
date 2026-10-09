@@ -1,10 +1,11 @@
 import { Bot } from "grammy";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { approvals, users } from "@/db/schema";
+import { approvals, jobs, products, users } from "@/db/schema";
 import { createLoginLink } from "@/lib/auth";
 import { getEnv, isTelegramConfigured } from "@/lib/env";
 import { getActiveProductId, isKillSwitchActive, setKillSwitch } from "@/lib/settings";
+import { slugify } from "@/lib/slug";
 
 let bot: Bot | null = null;
 
@@ -78,7 +79,83 @@ function registerHandlers(instance: Bot) {
 
   instance.command("riset", async (ctx) => {
     const produk = ctx.match?.toString().trim();
-    await ctx.reply(produk ? `Riset dimulai untuk: ${produk}` : "Contoh: /riset kue kering premium");
+    if (!produk) {
+      return ctx.reply(
+        "Contoh: /riset kue kering premium\n\n" +
+        "Ini akan membuat kandidat produk dan memulai job riset."
+      );
+    }
+
+    const user = await findUser(ctx.from?.id ?? 0);
+    if (!user) return ctx.reply("Akun ini tidak terdaftar.");
+
+    // Cek kill switch
+    if (await isKillSwitchActive()) {
+      return ctx.reply("Kill switch aktif: riset dibatalkan.");
+    }
+
+    try {
+      // Buat produk kandidat
+      const [product] = await db
+        .insert(products)
+        .values({
+          name: produk,
+          slug: slugify(produk),
+          kind: "other",
+          origin: "research",
+          status: "candidate",
+          context: { telegramUserId: user.telegramUserId },
+          createdBy: user.id,
+        })
+        .returning();
+
+      // Buat job research
+      const [job] = await db
+        .insert(jobs)
+        .values({
+          workflowKey: "research",
+          trigger: "user",
+          status: "queued",
+          input: {
+            productIds: [product.id],
+            ownerContext: {
+              productType: "other",
+              location: "Telegram",
+              capitalIdr: 0,
+              minMarginPct: 0,
+              productionCapability: "Via Telegram",
+            },
+            telegramUserId: user.telegramUserId,
+          },
+        })
+        .returning();
+
+      // Panggil webhook n8n (fire and forget)
+      const env = getEnv();
+      if (env.N8N_WEBHOOK_BASE) {
+        fetch(`${env.N8N_WEBHOOK_BASE.replace(/\/$/, "")}/research`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-n8n-secret": env.N8N_TRIGGER_SECRET },
+          body: JSON.stringify({ jobId: job.id, input: { productIds: [product.id], ownerContext: {} } }),
+        }).catch((e) => {
+          console.error("[telegram] n8n webhook error:", e);
+          db.update(jobs).set({ status: "failed", error: "Gagal memicu webhook n8n." }).where(eq(jobs.id, job.id));
+        });
+      } else {
+        await db.update(jobs).set({ status: "failed", error: "N8N_WEBHOOK_BASE belum diisi" }).where(eq(jobs.id, job.id));
+        return ctx.reply("Riset gagal: N8N_WEBHOOK_BASE belum diisi di server.");
+      }
+
+      await ctx.reply(
+        `✅ Riset dimulai untuk: ${produk}\n` +
+        `Job ID: \`${job.id}\`\n` +
+        `Produk ID: \`${product.id}\`\n\n` +
+        `Cek status di dashboard → Riset Pasar atau tunggu notifikasi selesai.`
+      );
+    } catch (e) {
+      console.error("[telegram] riset error:", e);
+      await ctx.reply("Gagal memulai riset. Coba lagi nanti.");
+    }
   });
 
   instance.command("brief", async (ctx) => {
@@ -120,4 +197,11 @@ export function getBot(): Bot | null {
     registerHandlers(bot);
   }
   return bot;
+}
+
+/** Inisialisasi bot (dipanggil sekali saat startup/webhook). */
+export async function initBot(): Promise<Bot | null> {
+  const b = getBot();
+  if (b) await b.init();
+  return b;
 }

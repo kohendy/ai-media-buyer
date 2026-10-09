@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Check, Database, Puzzle, Radar, Search, ShieldAlert, Target, TrendingUp } from "lucide-react";
+import { ArrowLeft, Check, Database, Puzzle, Radar, Search, ShieldAlert, Target, TrendingUp, AlertTriangle } from "lucide-react";
 import {
   Button,
-  DetailList,
+  Empty,
   PageHeader,
   Panel,
   Stat,
@@ -19,50 +19,116 @@ import {
 } from "@/components/ui";
 
 import { titleize } from "@/lib/slug";
+import type { Data } from "@/lib/riset-types";
 
-export function MarketBriefView({ productId }: { productId: string }) {
+function formatDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function formatRupiahRange(min: number | null, max: number | null): string {
+  const fmt = (n: number | null) => n ? new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", maximumFractionDigits: 0 }).format(n) : "—";
+  if (min && max) return `${fmt(min)} – ${fmt(max)}`;
+  if (min) return `≥ ${fmt(min)}`;
+  if (max) return `≤ ${fmt(max)}`;
+  return "—";
+}
+
+function getScoreLabel(key: string): string {
+  switch (key) {
+    case "demand": return "Permintaan";
+    case "competition": return "Persaingan";
+    case "margin": return "Margin";
+    case "ad_ease": return "Kemudahan diiklankan";
+    case "owner_fit": return "Kecocokan pemilik";
+    default: return key;
+  }
+}
+
+export function MarketBriefView({ productId, data }: { productId: string; data: Data }) {
   const router = useRouter();
-  const name = titleize(productId);
+  const name = data?.product?.name ?? titleize(productId);
+  const brief = data?.brief;
+  const scores = data?.scores ?? [];
+  const product = data?.product;
+
+  if (!brief) {
+    return (
+      <>
+        <PageHeader
+          title="Market Brief"
+          description={`${name} · belum ada data riset`}
+        >
+          <Link className={btnClass("default")} href="/riset">
+            <ArrowLeft className="size-4" aria-hidden />
+            Daftar kandidat
+          </Link>
+        </PageHeader>
+        <Panel>
+          <Empty
+            icon={Search}
+            title="Belum ada market brief"
+            message="Riset untuk produk ini belum selesai. Periksa status job di halaman Riset Pasar."
+          />
+        </Panel>
+      </>
+    );
+  }
+
+  const hasScores = scores.length === 5;
 
   return (
     <>
       <PageHeader
         title="Market Brief"
-        description={`${name} · versi 1 · disusun 6 Oktober 2026 · sumber dan tanggal dicantumkan.`}
+        description={`${name} · versi {brief.version} · disusun {formatDate(brief.createdAt)} · sumber dan tanggal dicantumkan.`}
       >
         <Status label="Fakta vs dugaan dibedakan" tone="info" />
         <Link className={btnClass("default")} href="/riset">
           <ArrowLeft className="size-4" aria-hidden />
           Daftar kandidat
         </Link>
-        <Button
-          variant="primary"
-          icon={Check}
-          onClick={() => {
-            notify("Produk dipilih. Lanjut menyusun Insight Produk.");
-            router.push(`/produk/${productId}`);
-          }}
-        >
-          Gunakan produk ini
-        </Button>
+        {product?.status !== "selected" && (
+          <Button
+            variant="primary"
+            icon={Check}
+            onClick={async () => {
+              try {
+                const res = await fetch(`/api/products/${productId}/select`, { method: "POST" });
+                if (!res.ok) throw new Error("Gagal memilih produk");
+                notify(`${name} dipilih sebagai produk aktif.`);
+                router.push(`/produk/${productId}`);
+              } catch {
+                notify("Gagal memilih produk");
+              }
+            }}
+          >
+            Gunakan produk ini
+          </Button>
+        )}
       </PageHeader>
 
-      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat icon={TrendingUp} title="Permintaan" value="Tinggi" delta="+18% dalam 90 hari" trend="up" note="Pencarian dan penjualan naik" />
-        <Stat icon={Target} title="Harga pasar" value="Rp 89–159 rb" delta="Median Rp 124.000" trend="flat" note="Dari 6 penjual teratas" />
-        <Stat icon={Radar} title="Kompetitor aktif" value="6" delta="3 ganti angle 30 hari" trend="up" note="Dipantau di Ad Library" />
-        <Stat icon={Puzzle} title="Celah utama" value="Bukti bahan" delta="Belum ada yang menonjolkan" trend="flat" note="Peluang message match" />
-      </section>
+      {/* Skor Jev */}
+      {hasScores && (
+        <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5 mb-4">
+          {scores.map((s) => (
+            <Stat
+              key={s.questionKey}
+              icon={s.forwarded ? AlertTriangle : Target}
+              title={getScoreLabel(s.questionKey)}
+              value={s.answer.charAt(0).toUpperCase() + s.answer.slice(1)}
+              delta={`${Math.round(s.confidence * 100)}% keyakinan`}
+              trend={s.forwarded ? "down" : "up"}
+              note={s.forwarded ? "Di bawah ambang, perlu ditinjau" : "Melewati ambang keyakinan"}
+            />
+          ))}
+        </section>
+      )}
 
+      {/* Ringkasan utama dari brief */}
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_332px]">
         <div className="grid gap-4">
           <Panel title="Ringkasan permintaan" description="Fakta dari data publik, bukan jaminan hasil" icon={Search}>
-            <p className="text-sm leading-relaxed text-secondary">
-              Permintaan stabil dan berulang. Ulasan paling sering menyebut{" "}
-              <strong className="text-text">tekstur ringan</strong> dan{" "}
-              <strong className="text-text">tidak lengket</strong>. Puncak pembelian terjadi pada awal
-              bulan; musim ramai awal tahun dan menjelang Ramadan.
-            </p>
+            <p className="text-sm leading-relaxed text-secondary">{brief.demandSummary}</p>
           </Panel>
 
           <Panel
@@ -70,101 +136,101 @@ export function MarketBriefView({ productId }: { productId: string }) {
             description="Perkiraan dari iklan aktif, tanpa data belanja"
             icon={Radar}
           >
-            <TableWrap>
-              <Table>
-                <caption className="sr-only">Ringkasan kompetitor</caption>
-                <thead>
-                  <tr>
-                    <Th>Brand</Th>
-                    <Th>Angle utama</Th>
-                    <Th>Penawaran</Th>
-                    <Th>Lama tayang (perkiraan)</Th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr><Td>Glowlab</Td><Td>Bukti dermatolog</Td><Td>Bundling 2 botol</Td><Td numeric>84 hari</Td></tr>
-                  <tr><Td>Skin+</Td><Td>Harga termurah</Td><Td>Gratis ongkir</Td><Td numeric>41 hari</Td></tr>
-                  <tr><Td>Dermaclear</Td><Td>Sebelum–sesudah</Td><Td>Garansi 30 hari</Td><Td numeric>27 hari</Td></tr>
-                  <tr><Td>Naturé</Td><Td>Bahan alami</Td><Td>Cashback</Td><Td numeric>19 hari</Td></tr>
-                </tbody>
-              </Table>
-            </TableWrap>
+            {brief.competitors && Array.isArray(brief.competitors) && brief.competitors.length > 0 ? (
+              <TableWrap>
+                <Table>
+                  <caption className="sr-only">Ringkasan kompetitor</caption>
+                  <thead>
+                    <tr>
+                      <Th>Brand</Th>
+                      <Th>Angle utama</Th>
+                      <Th>Penawaran</Th>
+                      <Th>Lama tayang (perkiraan)</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brief.competitors.map((c: unknown, i: number) => {
+                      const comp = c as Record<string, unknown>;
+                      return (
+                        <tr key={i}>
+                          <Td>{String(comp.brand ?? "")}</Td>
+                          <Td>{String(comp.angle ?? "")}</Td>
+                          <Td>{String(comp.offer ?? "")}</Td>
+                          <Td numeric>{String(comp.days_running ?? comp.daysRunning ?? "—")} hari</Td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </Table>
+              </TableWrap>
+            ) : (
+              <p className="text-sm text-muted">Belum ada data kompetitor.</p>
+            )}
           </Panel>
 
           <Panel title="Celah pasar" description="Angle yang jenuh dan yang masih kosong" icon={Puzzle}>
-            <ul className="m-0 grid list-none gap-1.5 p-0">
-              <li className="flex gap-2 text-xs text-secondary">
-                <Check className="mt-0.5 size-3.5 shrink-0 text-success" aria-hidden />
-                <span>
-                  <strong className="text-text">Kosong:</strong> penjelasan kandungan dan cara kerja bahan
-                  dengan visual produk asli.
-                </span>
-              </li>
-              <li className="flex gap-2 text-xs text-secondary">
-                <Check className="mt-0.5 size-3.5 shrink-0 text-success" aria-hidden />
-                <span>
-                  <strong className="text-text">Kosong:</strong> testimoni pelanggan nyata berbahasa
-                  Indonesia untuk tipe kulit berminyak.
-                </span>
-              </li>
-              <li className="flex gap-2 text-xs text-secondary">
-                <ShieldAlert className="mt-0.5 size-3.5 shrink-0 text-warning-ink" aria-hidden />
-                <span>
-                  <strong className="text-text">Jenuh:</strong> klaim &ldquo;sebelum–sesudah&rdquo; dan
-                  janji hasil instan; berisiko ditolak Meta.
-                </span>
-              </li>
-            </ul>
+            <p className="text-sm leading-relaxed text-secondary">{brief.gaps ?? "Belum dianalisis."}</p>
           </Panel>
         </div>
 
         <div className="grid gap-4">
+          <Panel title="Harga pasar" description="Rentang harga dari data marketplace" icon={Target}>
+            <div className="text-2xl font-semibold tabular-nums">{formatRupiahRange(brief.priceMin, brief.priceMax)}</div>
+            <p className="text-xs text-muted mt-1">Rentang harga kompetitor</p>
+          </Panel>
+
           <Panel title="Risiko" description="Perlu mitigasi sebelum investasi besar" icon={ShieldAlert}>
-            <p className="text-sm leading-relaxed text-secondary">
-              Persaingan sedang dan produk mudah ditiru. Klaim kesehatan berisiko ditolak, jadi copy
-              harus fokus pada pengalaman pemakaian, bukan janji medis.
-            </p>
+            <p className="text-sm leading-relaxed text-secondary">{brief.risks ?? "Belum dianalisis."}</p>
             <div className="mt-3">
-              <Status label="Risiko klaim: sedang" tone="warning" />
+              <Status label="Risiko klaim: perlu review" tone="warning" />
             </div>
           </Panel>
 
+          <Panel title="Rekomendasi" description="Arah strategis dari riset" icon={TrendingUp}>
+            <p className="text-sm leading-relaxed text-secondary">{brief.recommendation ?? "Belum ada rekomendasi."}</p>
+          </Panel>
+
           <Panel title="Rencana validasi" description="Tes kecil sebelum skala" icon={TrendingUp}>
-            <DetailList
-              items={[
-                { term: "Budget tes", value: "Rp 500.000" },
-                { term: "Durasi", value: "3 hari" },
-                { term: "Hipotesis", value: 'Angle "bukti bahan" menurunkan CPA' },
-                { term: "Ukuran minimum", value: "30 hasil atau 3× CPA target" },
-              ]}
-            />
+            <p className="text-sm leading-relaxed text-secondary">{brief.validationPlan ?? "Belum direncanakan."}</p>
           </Panel>
         </div>
       </div>
 
+      {/* Sumber data */}
       <Panel
         title="Sumber data dan tanggal"
-        description="Setiap angka menyertai asalnya"
+        description="Setiap angka menyertai asalnya; dibedakan fakta, perkiraan, dan dugaan"
         icon={Database}
       >
-        <TableWrap>
-          <Table>
-            <caption className="sr-only">Sumber data market brief</caption>
-            <thead>
-              <tr>
-                <Th>Sumber</Th>
-                <Th>Jenis</Th>
-                <Th>Diambil</Th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><Td>Pencarian &amp; minat kategori skincare</Td><Td>Tren pencarian</Td><Td>5 Okt 2026</Td></tr>
-              <tr><Td>Penjual teratas di marketplace</Td><Td>Harga &amp; ulasan</Td><Td>5 Okt 2026</Td></tr>
-              <tr><Td>Snapshot iklan kompetitor (semi-manual)</Td><Td>Angle &amp; penawaran</Td><Td>4 Okt 2026</Td></tr>
-              <tr><Td>Brief pemilik</Td><Td>Harga, margin, kapasitas</Td><Td>3 Okt 2026</Td></tr>
-            </tbody>
-          </Table>
-        </TableWrap>
+        {brief.sources && brief.sources.length > 0 ? (
+          <TableWrap>
+            <Table>
+              <caption className="sr-only">Sumber data market brief</caption>
+              <thead>
+                <tr>
+                  <Th>Sumber</Th>
+                  <Th>Jenis</Th>
+                  <Th>Diambil</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {brief.sources.map((s, i) => (
+                  <tr key={i}>
+                    <Td>{s.label}</Td>
+                    <Td>
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-inner text-[10px] font-medium bg-muted">
+                        {s.kind.toUpperCase()}
+                      </span>
+                    </Td>
+                    <Td>{formatDate(s.retrievedAt)}</Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          </TableWrap>
+        ) : (
+          <p className="text-sm text-muted">Belum ada sumber data tercatat.</p>
+        )}
       </Panel>
     </>
   );
